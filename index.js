@@ -1,9 +1,11 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
-import { MongoClient, ObjectId } from "mongodb";
+import { ObjectId } from "mongodb";
 import multer from "multer";
-import { getAuth } from "./auth.js";
+import { getAuth, getMongoClient } from "./auth.js";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 dotenv.config();
 
@@ -12,10 +14,11 @@ const PORT = process.env.PORT || 5000;
 const frontendOrigin = new URL(
   process.env.FRONTEND_URL || process.env.BETTER_AUTH_URL || "http://localhost:3000",
 ).origin;
-const client = new MongoClient(process.env.MONGODB_URI);
-const database = client.db("book_nook");
+const client = getMongoClient();
+const database = client.db();
 const booksCollection = database.collection("books");
 const borrowsCollection = database.collection("borrows");
+let databaseConnection;
 const categories = new Set(["Fiction", "Science", "History", "Kids", "Others"]);
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -31,8 +34,26 @@ const upload = multer({
   },
 });
 
+function connectToDatabase() {
+  if (!databaseConnection) {
+    databaseConnection = client.connect().catch((error) => {
+      databaseConnection = undefined;
+      throw error;
+    });
+  }
+  return databaseConnection;
+}
+
 app.use(cors({ origin: frontendOrigin, credentials: true }));
 app.use(express.json({ limit: "1mb" }));
+app.use(async (_request, _response, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 function isValidObjectId(id) {
   return ObjectId.isValid(id);
@@ -41,7 +62,11 @@ function isValidObjectId(id) {
 function serializeDocument(document) {
   if (!document) return document;
   const { _id, ...fields } = document;
-  return { ...fields, id: _id.toString() };
+  return {
+    ...fields,
+    title: document.title ?? document.bookName,
+    id: _id.toString(),
+  };
 }
 
 function getBookOwnerFilter(user) {
@@ -278,6 +303,14 @@ app.post("/borrows", requireTrustedOrigin, requireUser, async (request, response
       response.status(400).json({ message: "Choose a valid return date." });
       return;
     }
+    const parsedReturnDate = new Date(`${returnDate}T00:00:00.000Z`);
+    if (
+      Number.isNaN(parsedReturnDate.getTime()) ||
+      parsedReturnDate.toISOString().slice(0, 10) !== returnDate
+    ) {
+      response.status(400).json({ message: "Choose a valid return date." });
+      return;
+    }
     const book = await booksCollection.findOne({ _id: new ObjectId(bookId) });
     if (!book) {
       response.status(404).json({ message: "Book not found." });
@@ -296,7 +329,7 @@ app.post("/borrows", requireTrustedOrigin, requireUser, async (request, response
     }
     const borrow = {
       bookId: new ObjectId(bookId),
-      bookTitle: book.title,
+      bookTitle: book.title ?? book.bookName,
       bookImage: book.image,
       borrowerId: request.user.id,
       borrowerEmail: request.user.email,
@@ -355,14 +388,18 @@ app.use((error, _request, response, _next) => {
 });
 
 async function startServer() {
-  await client.connect();
+  await connectToDatabase();
   console.log("Connected to MongoDB.");
   app.listen(PORT, () => {
     console.log(`BookNook API is running on port ${PORT}.`);
   });
 }
 
-startServer().catch((error) => {
-  console.error("Failed to start BookNook API:", error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+  startServer().catch((error) => {
+    console.error("Failed to start BookNook API:", error);
+    process.exitCode = 1;
+  });
+}
+
+export default app;
